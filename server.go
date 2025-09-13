@@ -51,6 +51,8 @@ type ManagedDownload struct {
 	Cancel     context.CancelFunc
 	Error      error
 	Mutex      sync.RWMutex
+	// Database record reference
+	DBRecord   *Download
 }
 
 // DownloadManager manages multiple concurrent downloads
@@ -67,7 +69,7 @@ func NewDownloadManager() *DownloadManager {
 }
 
 // AddDownload adds a new download to the manager
-func (dm *DownloadManager) AddDownload(id string, dl *downloader.Downloader) *ManagedDownload {
+func (dm *DownloadManager) AddDownload(id string, dl *downloader.Downloader, dbRecord *Download) *ManagedDownload {
 	ctx, cancel := context.WithCancel(context.Background())
 	
 	managed := &ManagedDownload{
@@ -77,6 +79,7 @@ func (dm *DownloadManager) AddDownload(id string, dl *downloader.Downloader) *Ma
 		StartTime:  time.Now(),
 		Context:    ctx,
 		Cancel:     cancel,
+		DBRecord:   dbRecord,
 	}
 	
 	dm.mutex.Lock()
@@ -154,8 +157,18 @@ func startDownloadHandler(c *gin.Context) {
 	// Create downloader instance
 	dl := downloader.NewDownloader(req.URL, filename, req.Threads)
 	
+	// Save to database
+	dbRecord, err := SaveDownload(downloadID, req.URL, filename, req.Threads)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error":   "Failed to save download to database",
+			"details": err.Error(),
+		})
+		return
+	}
+	
 	// Add to manager
-	managed := downloadManager.AddDownload(downloadID, dl)
+	managed := downloadManager.AddDownload(downloadID, dl, dbRecord)
 	
 	// Start download in goroutine
 	go func() {
@@ -164,7 +177,31 @@ func startDownloadHandler(c *gin.Context) {
 				managed.Mutex.Lock()
 				managed.Status = "failed"
 				managed.Error = fmt.Errorf("panic: %v", r)
+				// Update database
+				UpdateStatus(downloadID, "failed", managed.Error.Error())
 				managed.Mutex.Unlock()
+			}
+		}()
+		
+		// Start periodic progress updates to database
+		progressTicker := time.NewTicker(3 * time.Second)
+		defer progressTicker.Stop()
+		
+		go func() {
+			for {
+				select {
+				case <-managed.Context.Done():
+					return
+				case <-progressTicker.C:
+					managed.Mutex.RLock()
+					if managed.Downloader.Progress != nil {
+						bytesDownloaded := managed.Downloader.Progress.GetTotalDownloaded()
+						totalBytes := managed.Downloader.Progress.TotalSize
+						status := managed.Status
+						UpdateProgress(downloadID, bytesDownloaded, totalBytes, status)
+					}
+					managed.Mutex.RUnlock()
+				}
 			}
 		}()
 		
@@ -173,6 +210,8 @@ func startDownloadHandler(c *gin.Context) {
 			managed.Mutex.Lock()
 			managed.Status = "failed"
 			managed.Error = fmt.Errorf("failed to initialize download: %w", err)
+			// Update database
+			UpdateStatus(downloadID, "failed", managed.Error.Error())
 			managed.Mutex.Unlock()
 			return
 		}
@@ -182,6 +221,8 @@ func startDownloadHandler(c *gin.Context) {
 			managed.Mutex.Lock()
 			managed.Status = "failed"
 			managed.Error = fmt.Errorf("download failed: %w", err)
+			// Update database
+			UpdateStatus(downloadID, "failed", managed.Error.Error())
 			managed.Mutex.Unlock()
 			return
 		}
@@ -191,12 +232,20 @@ func startDownloadHandler(c *gin.Context) {
 			managed.Mutex.Lock()
 			managed.Status = "failed"
 			managed.Error = fmt.Errorf("verification failed: %w", err)
+			// Update database
+			UpdateStatus(downloadID, "failed", managed.Error.Error())
 			managed.Mutex.Unlock()
 			return
 		}
 		
 		managed.Mutex.Lock()
 		managed.Status = "completed"
+		// Update database with completion
+		if managed.Downloader.Progress != nil {
+			UpdateProgress(downloadID, managed.Downloader.Progress.TotalSize, managed.Downloader.Progress.TotalSize, "completed")
+		} else {
+			UpdateStatus(downloadID, "completed", "")
+		}
 		managed.Mutex.Unlock()
 	}()
 	
@@ -284,6 +333,13 @@ func pauseDownloadHandler(c *gin.Context) {
 	managed.Cancel()
 	managed.Status = "paused"
 	
+	// Update database
+	if managed.Downloader.Progress != nil {
+		UpdateProgress(downloadID, managed.Downloader.Progress.GetTotalDownloaded(), managed.Downloader.Progress.TotalSize, "paused")
+	} else {
+		UpdateStatus(downloadID, "paused", "")
+	}
+	
 	c.JSON(http.StatusOK, gin.H{
 		"message": "Download paused successfully",
 	})
@@ -318,6 +374,9 @@ func resumeDownloadHandler(c *gin.Context) {
 	managed.Status = "downloading"
 	managed.Error = nil
 	
+	// Update database status
+	UpdateStatus(downloadID, "downloading", "")
+	
 	// Resume download in goroutine
 	go func() {
 		defer func() {
@@ -325,7 +384,31 @@ func resumeDownloadHandler(c *gin.Context) {
 				managed.Mutex.Lock()
 				managed.Status = "failed"
 				managed.Error = fmt.Errorf("panic: %v", r)
+				// Update database
+				UpdateStatus(downloadID, "failed", managed.Error.Error())
 				managed.Mutex.Unlock()
+			}
+		}()
+		
+		// Restart periodic progress updates
+		progressTicker := time.NewTicker(3 * time.Second)
+		defer progressTicker.Stop()
+		
+		go func() {
+			for {
+				select {
+				case <-managed.Context.Done():
+					return
+				case <-progressTicker.C:
+					managed.Mutex.RLock()
+					if managed.Downloader.Progress != nil {
+						bytesDownloaded := managed.Downloader.Progress.GetTotalDownloaded()
+						totalBytes := managed.Downloader.Progress.TotalSize
+						status := managed.Status
+						UpdateProgress(downloadID, bytesDownloaded, totalBytes, status)
+					}
+					managed.Mutex.RUnlock()
+				}
 			}
 		}()
 		
@@ -334,6 +417,8 @@ func resumeDownloadHandler(c *gin.Context) {
 			managed.Mutex.Lock()
 			managed.Status = "failed"
 			managed.Error = fmt.Errorf("resume failed: %w", err)
+			// Update database
+			UpdateStatus(downloadID, "failed", managed.Error.Error())
 			managed.Mutex.Unlock()
 			return
 		}
@@ -343,12 +428,20 @@ func resumeDownloadHandler(c *gin.Context) {
 			managed.Mutex.Lock()
 			managed.Status = "failed"
 			managed.Error = fmt.Errorf("verification failed: %w", err)
+			// Update database
+			UpdateStatus(downloadID, "failed", managed.Error.Error())
 			managed.Mutex.Unlock()
 			return
 		}
 		
 		managed.Mutex.Lock()
 		managed.Status = "completed"
+		// Update database with completion
+		if managed.Downloader.Progress != nil {
+			UpdateProgress(downloadID, managed.Downloader.Progress.TotalSize, managed.Downloader.Progress.TotalSize, "completed")
+		} else {
+			UpdateStatus(downloadID, "completed", "")
+		}
 		managed.Mutex.Unlock()
 	}()
 	
@@ -414,8 +507,9 @@ func deleteDownloadHandler(c *gin.Context) {
 		managed.Cancel()
 	}
 	
-	// Remove from manager
+	// Remove from manager and database
 	downloadManager.RemoveDownload(downloadID)
+	RemoveDownload(downloadID)
 	
 	c.JSON(http.StatusOK, gin.H{
 		"message": "Download removed successfully",
@@ -465,6 +559,7 @@ func setupRoutes() *gin.Engine {
 		api.POST("/downloads/:id/pause", pauseDownloadHandler)
 		api.POST("/downloads/:id/resume", resumeDownloadHandler)
 		api.DELETE("/downloads/:id", deleteDownloadHandler)
+		api.GET("/stats", statsHandler)
 	}
 	
 	// Legacy routes (without /api/v1 prefix) for backward compatibility
@@ -474,14 +569,169 @@ func setupRoutes() *gin.Engine {
 	router.POST("/downloads/:id/pause", pauseDownloadHandler)
 	router.POST("/downloads/:id/resume", resumeDownloadHandler)
 	router.DELETE("/downloads/:id", deleteDownloadHandler)
+	router.GET("/stats", statsHandler)
 	router.GET("/health", healthHandler)
 	
 	return router
 }
 
+// resumeIncompleteDownloads loads incomplete downloads from database and resumes them
+func resumeIncompleteDownloads() {
+	fmt.Println("Checking for incomplete downloads to resume...")
+	
+	incompleteDownloads, err := GetIncompleteDownloadsFromDB()
+	if err != nil {
+		fmt.Printf("Error loading incomplete downloads: %v\n", err)
+		return
+	}
+	
+	if len(incompleteDownloads) == 0 {
+		fmt.Println("No incomplete downloads found.")
+		return
+	}
+	
+	fmt.Printf("Found %d incomplete downloads. Resuming...\n", len(incompleteDownloads))
+	
+	for _, dbRecord := range incompleteDownloads {
+		// Create downloader instance
+		dl := downloader.NewDownloader(dbRecord.URL, dbRecord.OutputPath, dbRecord.Threads)
+		
+		// Add to manager
+		managed := downloadManager.AddDownload(dbRecord.ID, dl, &dbRecord)
+		
+		// Start download in goroutine
+		go func(downloadID string, managed *ManagedDownload) {
+			defer func() {
+				if r := recover(); r != nil {
+					managed.Mutex.Lock()
+					managed.Status = "failed"
+					managed.Error = fmt.Errorf("panic during resume: %v", r)
+					UpdateStatus(downloadID, "failed", managed.Error.Error())
+					managed.Mutex.Unlock()
+				}
+			}()
+			
+			// Start periodic progress updates to database
+			progressTicker := time.NewTicker(3 * time.Second)
+			defer progressTicker.Stop()
+			
+			go func() {
+				for {
+					select {
+					case <-managed.Context.Done():
+						return
+					case <-progressTicker.C:
+						managed.Mutex.RLock()
+						if managed.Downloader.Progress != nil {
+							bytesDownloaded := managed.Downloader.Progress.GetTotalDownloaded()
+							totalBytes := managed.Downloader.Progress.TotalSize
+							status := managed.Status
+							UpdateProgress(downloadID, bytesDownloaded, totalBytes, status)
+						}
+						managed.Mutex.RUnlock()
+					}
+				}
+			}()
+			
+			// Load existing progress
+			if err := dl.LoadOrCreateProgress(); err != nil {
+				managed.Mutex.Lock()
+				managed.Status = "failed"
+				managed.Error = fmt.Errorf("failed to load progress: %w", err)
+				UpdateStatus(downloadID, "failed", managed.Error.Error())
+				managed.Mutex.Unlock()
+				return
+			}
+			
+			// Resume download
+			if err := dl.Download(); err != nil {
+				managed.Mutex.Lock()
+				managed.Status = "failed"
+				managed.Error = fmt.Errorf("resume failed: %w", err)
+				UpdateStatus(downloadID, "failed", managed.Error.Error())
+				managed.Mutex.Unlock()
+				return
+			}
+			
+			// Verify download
+			if err := dl.VerifyDownload(); err != nil {
+				managed.Mutex.Lock()
+				managed.Status = "failed"
+				managed.Error = fmt.Errorf("verification failed: %w", err)
+				UpdateStatus(downloadID, "failed", managed.Error.Error())
+				managed.Mutex.Unlock()
+				return
+			}
+			
+			managed.Mutex.Lock()
+			managed.Status = "completed"
+			// Update database with completion
+			if managed.Downloader.Progress != nil {
+				UpdateProgress(downloadID, managed.Downloader.Progress.TotalSize, managed.Downloader.Progress.TotalSize, "completed")
+			} else {
+				UpdateStatus(downloadID, "completed", "")
+			}
+			managed.Mutex.Unlock()
+			
+			fmt.Printf("Resumed download completed: %s\n", downloadID)
+		}(dbRecord.ID, managed)
+		
+		fmt.Printf("Resumed download: %s (%s)\n", dbRecord.ID, dbRecord.URL)
+	}
+}
+
+// statsHandler handles GET /stats (bonus endpoint)
+func statsHandler(c *gin.Context) {
+	if dbManager == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"error": "Database not available",
+		})
+		return
+	}
+	
+	stats, err := dbManager.GetDownloadStats()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Failed to get download statistics",
+			"details": err.Error(),
+		})
+		return
+	}
+	
+	c.JSON(http.StatusOK, gin.H{
+		"statistics": stats,
+		"timestamp": time.Now().Format(time.RFC3339),
+	})
+}
+
 func main() {
 	fmt.Println("Multithreaded Downloader REST API Server")
 	fmt.Println("========================================")
+	
+	// Initialize database
+	if err := InitDatabase("downloads.db"); err != nil {
+		log.Fatalf("Failed to initialize database: %v", err)
+	}
+	defer func() {
+		if dbManager != nil {
+			dbManager.Close()
+		}
+	}()
+	
+	// Resume incomplete downloads
+	resumeIncompleteDownloads()
+	
+	// Start cleanup routine for old completed downloads
+	go func() {
+		ticker := time.NewTicker(24 * time.Hour) // Clean up daily
+		defer ticker.Stop()
+		
+		for range ticker.C {
+			if err := dbManager.CleanupCompletedDownloads(7 * 24 * time.Hour); err != nil {
+				fmt.Printf("Error during cleanup: %v\n", err)
+			}
+		}
+	}()
 	
 	router := setupRoutes()
 	
@@ -496,6 +746,7 @@ func main() {
 	fmt.Println("  POST   /downloads/:id/pause  - Pause a download")
 	fmt.Println("  POST   /downloads/:id/resume - Resume a download")
 	fmt.Println("  DELETE /downloads/:id        - Remove a download")
+	fmt.Println("  GET    /stats               - Download statistics")
 	fmt.Println("  GET    /health              - Health check")
 	
 	if err := router.Run(":" + port); err != nil {

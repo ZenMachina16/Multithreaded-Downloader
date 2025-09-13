@@ -1,0 +1,36 @@
+version: '3.8'
+
+services:
+  downloader:
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      # Persistent database storage
+      - downloader_data:/app/data
+      # Downloaded files storage  
+      - downloader_files:/app/downloads
+      # Optional: Mount host directory for downloads
+      # - ./downloads:/app/downloads
+    environment:
+      - GIN_MODE=release
+      - DATABASE_PATH=/app/data/downloads.db
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - downloader_network
+
+volumes:
+  downloader_data:
+    driver: local
+  downloader_files:
+    driver: local
+
+networks:
+  downloader_network:
+    driver: bridge
