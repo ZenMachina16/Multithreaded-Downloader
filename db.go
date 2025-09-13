@@ -6,10 +6,9 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"gorm.io/driver/sqlite"
+	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
-	_ "modernc.org/sqlite" // Pure Go SQLite driver
 )
 
 // Download represents a download record in the database
@@ -34,8 +33,13 @@ type DatabaseManager struct {
 
 var dbManager *DatabaseManager
 
-// InitDatabase initializes the SQLite database connection and creates tables
+// InitDatabase initializes the SQLite database connection and creates tables (deprecated)
 func InitDatabase(dbPath string) error {
+	return fmt.Errorf("SQLite support deprecated, use InitPostgreSQLDatabase instead")
+}
+
+// InitPostgreSQLDatabase initializes the PostgreSQL database connection and creates tables
+func InitPostgreSQLDatabase(databaseURL string) error {
 	// Configure GORM logger for production
 	gormLogger := logger.New(
 		log.New(log.Writer(), "\r\n", log.LstdFlags),
@@ -48,23 +52,28 @@ func InitDatabase(dbPath string) error {
 	)
 
 	// Open database connection
-	db, err := gorm.Open(sqlite.Open(dbPath), &gorm.Config{
+	db, err := gorm.Open(postgres.Open(databaseURL), &gorm.Config{
 		Logger: gormLogger,
 	})
 	if err != nil {
-		return fmt.Errorf("failed to connect to database: %w", err)
+		return fmt.Errorf("failed to connect to PostgreSQL database: %w", err)
 	}
 
-	// Configure SQLite connection pool
+	// Configure PostgreSQL connection pool
 	sqlDB, err := db.DB()
 	if err != nil {
 		return fmt.Errorf("failed to get underlying sql.DB: %w", err)
 	}
 
-	// Set connection pool settings
+	// Set connection pool settings for PostgreSQL
 	sqlDB.SetMaxIdleConns(10)
 	sqlDB.SetMaxOpenConns(100)
 	sqlDB.SetConnMaxLifetime(time.Hour)
+
+	// Test connection
+	if err := sqlDB.Ping(); err != nil {
+		return fmt.Errorf("failed to ping PostgreSQL database: %w", err)
+	}
 
 	// Auto-migrate the schema
 	if err := db.AutoMigrate(&Download{}); err != nil {
@@ -73,7 +82,7 @@ func InitDatabase(dbPath string) error {
 
 	dbManager = &DatabaseManager{db: db}
 	
-	fmt.Println("Database initialized successfully")
+	fmt.Println("PostgreSQL database initialized successfully")
 	return nil
 }
 
