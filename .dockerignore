@@ -1,0 +1,51 @@
+# Git
+.git
+.gitignore
+
+# Documentation
+*.md
+!README.md
+!PERSISTENCE_README.md
+
+# Test files
+*_test.go
+test_*.go
+*_test.sh
+test_*.sh
+
+# Build artifacts
+*.exe
+server
+downloader
+
+# Database files
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Download state files
+download_state.json
+*_state.json
+
+# Downloaded files
+downloads/
+*.zip
+*.tar.gz
+*.iso
+*.bin
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+*.log
