@@ -1,5 +1,5 @@
 # Dockerfile for the queue-based API server
-FROM golang:1.21-alpine AS builder
+FROM golang:1.17-alpine AS builder
 
 # Install build dependencies
 RUN apk add --no-cache \
@@ -45,8 +45,7 @@ RUN mkdir -p /app/data && \
 WORKDIR /app
 
 # Copy binary from builder stage
-COPY --from=builder /app/server-queue .
-COPY --chown=appuser:appgroup --from=builder /app/server-queue .
+COPY --from=builder --chown=appuser:appgroup /app/server-queue .
 
 # Switch to non-root user
 USER appuser
